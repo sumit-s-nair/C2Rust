@@ -123,10 +123,7 @@ Our approach shows that **the compiler itself is a sufficient teacher**. You don
 
 ## Links
 
-- 🤗 **HuggingFace Space**: [shiftenv/c2rust-rl](https://huggingface.co/spaces/shiftenv/c2rust-rl)
-- 📓 **Colab Notebook**: [train_qwen_colab.ipynb](https://colab.research.google.com/...)
-- 📊 **W&B Training Run**: [wandb.ai/c2rust-rl](https://wandb.ai/...)
-- 🦀 **GitHub**: [shiftenv-v2](https://github.com/sumit-s-nair/shiftenv-v2)
+- **W&B Training Run**: [wandb.ai/c2rust-rl](https://wandb.ai/shiftenv/c2rust-rl/runs/v017tewq)
 
 ---
 
