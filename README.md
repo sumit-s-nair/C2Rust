@@ -1,130 +1,233 @@
 ---
-title: C2Rust RL
-emoji: 🦀
+title: C2Rust OpenEnv Server
+emoji: crab
 colorFrom: blue
 colorTo: green
 sdk: docker
+app_port: 7860
 pinned: false
 ---
 
-# C2Rust — Teaching LLMs to Migrate C to Safe Rust
+# C2Rust OpenEnv: Compiler-Driven C to Rust Migration
 
-*Meta PyTorch OpenEnv Hackathon x SST India 2026 · Theme #2: Long-Horizon Planning*
+This repository implements an end-to-end pipeline to migrate C modules to Rust and optionally train a local model online using compiler feedback.
 
----
+Core idea: use the Rust compiler as the reward oracle. The system generates Rust candidates, scores them with `cargo check`, and uses those rewards to improve future generations.
 
-## The Problem Nobody Wants to Talk About
+## Architecture Overview
 
-C is everywhere. It powers your operating system kernel, your database engine, your cryptographic library, your network stack. Billions of lines of it, written over five decades, sitting in production systems that the modern world depends on.
+The structure below maps your architecture diagram to the current implementation.
 
-And it is quietly destroying us.
+| Diagram block | What it does here | Main files |
+|---|---|---|
+| Input | C code modules and test folders are scanned in epochs | `main.py`, `tests/` |
+| Static analyzer | Extracts AST, includes/exports, pointers, and call graph | `analyzer.py` |
+| Persistent memory store | Stores migration progress and dependency resolution state | `memory_generate.py`, `update_memory.py`, `migration_state.json`, `migrator_data/*.json` |
+| Module handler and optimizer | Picks the next unblocked module with dependency-aware heuristics | `choose_module.py` |
+| Main agent loop (RL) | Choose -> rewrite -> compile/score -> update state -> repeat | `main.py` |
+| Code writer (LLM agent) | Generates Rust either via OpenAI API or local QLoRA model | `C2RustAI.py`, `C2RustLocal.py` |
+| Reward signal | Scores code quality from compiler diagnostics plus style penalties and bonuses | `reward.py` |
+| Tester and environment API | Exposes scoring tools through OpenEnv/FastAPI for external RL agents | `env/server/c2rust_environment.py`, `env/server/app.py`, `env/client.py` |
 
-Memory-safety vulnerabilities — buffer overflows, use-after-free, dangling pointers, double frees — account for roughly 70% of critical security bugs in large C/C++ codebases. Microsoft, Google, and Mozilla all report similar numbers. The fix has been known for years: **Rust**. Rust's ownership model makes an entire class of memory bugs a compile-time impossibility.
+```mermaid
+flowchart TD
+    A[Input: C modules] --> B[Static Analyzer]
+    B --> C[AST + Pointer + Dependency JSON]
+    C --> D[Migration State Memory]
+    D --> E[Next Module Selector]
+    E --> F[Code Writer]
+    F --> G[Compiler Reward]
+    G --> H[State Reconcile]
+    H --> E
+    G --> I[Local GRPO Update]
+```
 
-The problem? Migration.
+## How the Migration Loop Works
 
-Existing automated tools will translate C syntax into Rust — but they produce code littered with `unsafe` blocks. Mechanically correct, semantically the same as C. You haven't gained Rust's safety guarantees; you've just wrapped your C in a Rust-coloured box. The dangerous patterns remain.
+`main.py` runs a long-horizon loop over a hardcoded curriculum of folders:
 
-What we need is not a *translator* but a *teacher* — a system that genuinely understands ownership and idiomatic Rust well enough to rewrite C code in a way the compiler can verify as *safe*.
+1. Select an epoch folder (for example `tests/easy/folder_1`).
+2. Rebuild static analysis output for that folder with `analyzer.py`.
+3. Initialize migration memory (`migration_state.json`) from `dependencies.json`.
+4. Repeatedly:
+   - Choose next module with `pick_next_module(...)`.
+   - Generate Rust with the selected engine.
+   - Mark module migrated and reconcile dependency progress.
+5. Cleanup epoch artifacts.
+6. After all epochs, attempt to generate a Cargo project and (for local engine) a report.
 
----
+Important current behavior:
 
-## The Insight: The Compiler Already Knows
+- Epoch list is hardcoded inside `main.py` (`target_epochs`).
+- End-of-epoch cleanup deletes `migrator_data/`, output folder, and state file.
+- `--engine local` is the actively wired training path.
+- `--engine openai` path in `main.py` is currently a placeholder unless you re-enable the import assignment.
 
-The Rust compiler already embodies decades of careful thinking about what makes code memory-safe. Every time it rejects code with an ownership violation or a lifetime error, it's teaching you something. What if we could use that signal to train a model?
+## Reward Function
 
-That's exactly what we built. Instead of a syntactic translator, we built an **Online RL agent** where the Rust compiler itself is the teacher. No human-labelled datasets. No offline fine-tuning on "correct" translations. Just: generate Rust, run the compiler, score the output, update the model. Repeat for every file in the repository.
+`reward.py` computes a scalar score in `[0, 1]` using:
 
----
+- Compilation score from `cargo check`.
+- Penalties for warnings, `unsafe`, `unwrap`/`expect`, and C-like anti-patterns.
+- Bonuses for idiomatic Rust (`Result`, `Option`, iterator usage).
 
-## How It Works
+If compile fails, partial credit is still possible based on error count, which gives smoother learning than binary pass/fail.
 
-### Stage 1 — Static Analysis
+## Repository Map
 
-The first thing the system does is deeply analyse the entire C codebase before attempting to translate a single line. This is done through three lenses simultaneously.
+| Path | Purpose |
+|---|---|
+| `main.py` | End-to-end orchestrator over all epochs |
+| `analyzer.py` | libclang-based AST/pointer/dependency extraction |
+| `choose_module.py` | Dependency-aware module scheduler |
+| `memory_generate.py` | Builds initial migration state JSON |
+| `update_memory.py` | Reconciles migrated imports/exports and global stats |
+| `mark_migrated.py` | Marks selected module complete |
+| `reward.py` | Compiler-driven reward logic |
+| `C2RustLocal.py` | Local Qwen + QLoRA + online GRPO-style updates |
+| `C2RustAI.py` | OpenAI-based translation engine |
+| `gen_cargo.py` | Creates Cargo layout from generated `.rs` files |
+| `env/server/app.py` | OpenEnv FastAPI entry point |
+| `env/server/c2rust_environment.py` | MCP tools: `translate_c_file`, `score_rust_code` |
+| `openenv.yaml` | Environment metadata and tool schema |
 
-An **AST parser** (using Clang's compiler frontend) builds a full syntax tree for every source file — not a regex scan, but a true compiler-level parse that understands type declarations, function signatures, control flow, and scope. This gives the system a precise structural understanding of what every file *is*.
+## Quick Start
 
-A **pointer analyser** walks that AST looking specifically for ownership-critical patterns: raw pointer declarations, pointer aliasing, array-pointer decay, and anywhere memory is manually allocated or freed. These are exactly the locations where Rust's borrow checker will push back hardest, so knowing where they are upfront lets the agent approach them with more care.
+### 1) Prerequisites
 
-Finally, a **dependency graph** is extracted — a directed graph where each node is a module and each edge represents an `#include` relationship or a cross-module function call. This graph captures the full import/export surface of the codebase and is what makes the ordering problem solvable.
+- Python 3.11+
+- Rust toolchain (`cargo`, `rustc`)
+- LLVM/Clang with libclang headers
+- Optional NVIDIA GPU for local 4-bit QLoRA training
 
-### Stage 2 — Persistent Memory
+### 2) Install Dependencies
 
-All of that analysis feeds into a persistent memory store that the system maintains and updates throughout the entire migration run. This store tracks three things: the migration status of every module (how far along it is, how many retries it took, how many errors remain), a pattern memory that records which types of transformations have historically succeeded (e.g. "pointer-to-slice conversions in this pattern usually compile cleanly"), and an error history that logs every borrow/lifetime/ownership error the compiler has returned so far.
+Full pipeline (analysis + migration + local training):
 
-This memory is what separates the system from a stateless file-by-file translator. As the migration progresses, the agent is continuously learning from its own history.
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
 
-### Stage 3 — Module Selection
+If installing CUDA PyTorch manually, quote the version specifier:
 
-Before each translation step, the system has to decide *which* module to tackle next. This is non-trivial — you can't translate a file that depends on a module you haven't translated yet, or the generated imports will be broken.
+```bash
+pip install "torch>=2.0.0" --index-url https://download.pytorch.org/whl/cu121
+```
 
-We solve this with a **topological sort** over the dependency graph, which gives us a valid ordering where all dependencies of a module are always migrated before the module itself. Within the set of currently-valid candidates (those with all dependencies resolved), we then rank by an estimate of how likely each module is to succeed — smaller API surface, fewer pointer-heavy patterns, lower downstream risk. The net effect is that the agent always tackles the easiest currently-unblocked module, which maximises the speed at which the valid candidate set grows.
+Environment server only (lightweight, no training stack):
 
-### Stage 4 — The Main RL Loop
+```bash
+pip install -r requirements-env.txt
+```
 
-This is where the core work happens, and it runs as a tight loop: **choose → rewrite → compile → reward → repeat**.
+### 3) Run Local Migration (Recommended Path)
 
-The LLM agent — **Qwen2.5-Coder-7B-Instruct**, running at 4-bit quantisation via QLoRA — receives the C source for the chosen module, enriched with context: the AST summary, the list of already-migrated dependencies it can import, and any compiler errors from a previous failed attempt on this same file. It generates several candidate Rust translations in parallel (we use a group size of 4, which is the GRPO requirement).
+```bash
+python main.py --engine local --source tests --output rust_output --wandb
+```
 
-Every candidate is immediately compiled with `cargo check`. The compiler output — success or failure, and if failure exactly *which* errors — feeds directly into the reward function.
+Debug mode (no parameter update; logs reward comparisons):
 
-### Stage 5 — The Reward Function
+```bash
+python main.py --engine local --debug --debug-log debug_log.md
+```
 
-The reward function is what shapes the agent's behaviour over time. It's designed to capture not just "does this compile" but "is this *good* Rust":
+### 4) Run OpenAI Engine
 
-- A **clean compile with no unsafe blocks** scores at the top
-- A compile with `unsafe` blocks scores meaningfully lower — the code works but hasn't achieved the goal
-- **C-isms** that survived the translation (raw pointer types, manual memory patterns, C standard library calls) are penalised even if the code compiles, because they indicate the agent didn't truly understand the transformation
-- **Idiomatic Rust patterns** — using `Result` and `Option` types for error handling, iterator combinators instead of index loops, ownership-aware data structures — are positively rewarded
-- If the code doesn't compile, partial credit is given based on how many errors there are: 1 error is much better than 10, and the reward reflects that
+```bash
+export OPENAI_API_KEY=your_key_here
+python main.py --engine openai --source tests
+```
 
-This shaped reward gives the agent a meaningful gradient to follow at every stage of training, even when clean compilation is still rare.
+Note: in the current code, the OpenAI conversion function assignment in `main.py` is commented out; re-enable it before relying on this mode.
 
-### Stage 6 — Online RL Fine-tuning with GRPO
+## OpenEnv Server Usage
 
-After scoring all candidates, we run a **GRPO** (Group Relative Policy Optimisation) update step. GRPO computes the advantage of each candidate relative to the mean reward of the group — a positive advantage means "this output was better than average, do more of this", negative means "this was worse than average, do less of this". Those advantages are used to update the model's lightweight LoRA adapter weights via a standard gradient step.
+Run server:
 
-Because we're running LoRA (Low-Rank Adaptation), we're only updating a tiny fraction of the model's parameters — which makes online training on a single GPU feasible. The base model's weights stay frozen; only the adapters update.
+```bash
+uvicorn env.server.app:app --host 0.0.0.0 --port 7860
+```
 
-Crucially, this is **online** RL: the model is training on its own live outputs as it migrates. Every file processed is both a completed translation *and* a training step. The model that translates the last file in the repository is observably better than the one that started.
+Use the client:
 
-### Stage 7 — Testing and Verification
+```python
+from env.client import C2RustEnv
+import json
 
-Once a module passes compilation, it goes through a final verification stage. The borrow checker output is inspected for structured lifetime and ownership errors — even warnings are surfaced. Where test cases exist, semantic equivalence is checked by running the test suite against both the original C and the translated Rust, comparing outputs. Metrics including test pass rate, unsafe block count, and complexity delta are recorded per module.
+with C2RustEnv(base_url="http://localhost:7860") as env:
+    obs = env.reset()
+    c_source = obs.observation.metadata["c_source"]
+    module_name = obs.observation.metadata["module_name"]
 
-If a module fails verification, it's returned to the RL loop with the failure messages appended to the observation — the agent sees exactly what went wrong and retries. Only once a module passes do we mark it migrated, unlock its dependents in the topological order, and move on.
+    # Replace with your generated Rust code
+    result = env.call_tool(
+        "translate_c_file",
+        rust_code="fn main() {}",
+        module_name=module_name,
+    )
+    print(json.loads(result))
+```
 
----
+Available MCP tools:
 
-## Results
+- `translate_c_file(rust_code, module_name)` returns JSON with reward and diagnostics.
+- `score_rust_code(rust_code, module_name)` returns float reward only.
 
-*Training was run on an NVIDIA A10G GPU across progressively harder batches of C files.*
+## CLI Flags (`main.py`)
 
-<!-- RESULTS PLACEHOLDER — add training_curves.png and key numbers here -->
+| Flag | Description |
+|---|---|
+| `--source` | Root C source directory (default: `tests`) |
+| `--output` | Rust output directory (default: `rust_output`) |
+| `--state` | Migration state JSON path |
+| `--migrator-data` | Analyzer output directory |
+| `--engine` | `local` or `openai` |
+| `--debug` | Local engine only: evaluate samples without training updates |
+| `--debug-log` | Debug markdown log path |
+| `--wandb` | Enable Weights and Biases logging (local engine) |
 
-**Training curves and metrics coming here.**
+## Environment Variables
 
-Key takeaways from the run:
-- Mean reward roughly doubled over the course of training as the policy improved
-- `unsafe` block usage dropped sharply in the first quarter of training and stayed low
-- Compilation success rate went from ~40% on first attempts to ~75% by the end of the easier batches
-- GRPO loss remained stable throughout — no policy collapse
+| Variable | Used by | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | `C2RustAI.py` | Required for OpenAI engine |
+| `WANDB_API_KEY` | `C2RustLocal.py` | Optional W&B online logging (falls back to offline mode) |
+| `HF_TOKEN` | `main.py`, `C2RustLocal.py` | Optional adapter upload to Hugging Face Hub |
+| `ADAPTER_DIR` | `C2RustLocal.py`, `main.py` | Location for LoRA adapter checkpoints |
+| `MAX_CONCURRENT_ENVS` | `env/server/app.py` | OpenEnv server concurrency limit |
 
----
+## Output Artifacts
 
-## Why This Matters
+Depending on mode and cleanup settings, you may see:
 
-This isn't a toy problem. Every major software organisation with a significant C codebase faces this exact challenge. The Linux kernel has [ongoing Rust adoption](https://lore.kernel.org/rust-for-linux/). Android. OpenSSL. SQLite. The economic and security value of a system that can intelligently migrate this code — understanding ownership rather than just syntax — is enormous.
+- `migrator_data/ast.json`
+- `migrator_data/pointers.json`
+- `migrator_data/dependencies.json`
+- `migrator_data/call_graph.json`
+- `migration_state.json`
+- `rust_output/*.rs` (before epoch cleanup)
+- `rust_output/training_curves.png` (local engine report)
+- `rust_output/training_history.json` (local engine report)
+- `rust_output/hackathon_report.md` (local engine report)
+- `lora_adapters/` (or `ADAPTER_DIR`) for adapter checkpoints
 
-Our approach shows that **the compiler itself is a sufficient teacher**. You don't need human-annotated translations. The Rust type system, with its decades of careful design, already encodes everything that makes code safe. Using `cargo check` as the reward oracle isn't a shortcut — it's using exactly the right signal.
+## Known Limitations
 
----
+- Curriculum folders are currently hardcoded in `main.py`.
+- Epoch cleanup can remove generated Rust outputs unless adjusted.
+- Reward is compiler-focused (`cargo check`); project-level semantic test execution is not currently integrated into the main loop.
+- `analyzer.py` depends on libclang and may require include-path tuning for non-trivial external C projects.
 
-## Links
+## Docker and Hugging Face Spaces
 
-- **W&B Training Run**: [wandb.ai/c2rust-rl](https://wandb.ai/shiftenv/c2rust-rl/runs/v017tewq)
+- `Dockerfile` starts the OpenEnv API server on port `7860`.
+- `openenv.yaml` declares the environment entrypoint and tool schema.
+- For Spaces deployment, set secrets such as `HF_TOKEN` and optionally `WANDB_API_KEY`.
 
----
+## Project Context
 
-*Built for the OpenEnv Hackathon India 2026 by Team Puru. C code doesn't have to be unsafe forever.*
+Built for Meta PyTorch OpenEnv Hackathon x SST India 2026, focused on long-horizon planning for C to safe Rust migration.

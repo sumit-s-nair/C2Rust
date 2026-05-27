@@ -1,4 +1,6 @@
-from .c2rust_env import C2RustEnv
-from .c2rust_repo_env import C2RustRepoEnv
+"""C2Rust RL Environment — OpenEnv package exports."""
 
-__all__ = ["C2RustEnv", "C2RustRepoEnv"]
+from .client import C2RustEnv
+from .models import C2RustAction, C2RustObservation, C2RustState
+
+__all__ = ["C2RustEnv", "C2RustAction", "C2RustObservation", "C2RustState"]

@@ -1,51 +1,29 @@
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# System build tools + Python 3.11
+# 1. Install System Dependencies, Clang (for AST parsing), and Rust (for rewards)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        software-properties-common curl ca-certificates \
-    && add-apt-repository ppa:deadsnakes/ppa \
-    && apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 python3.11-dev python3.11-distutils \
-        gcc make build-essential libssl-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
-    && ln -sf python3.11 /usr/bin/python3 \
-    && ln -sf python3.11 /usr/bin/python
-
-# Rust toolchain (stable)
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        curl build-essential libclang-dev \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain stable --profile minimal \
-    && . /root/.cargo/env \
-    && rustup component add clippy
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup component add clippy
 
 WORKDIR /app
 
-# PyTorch with CUDA 12.4 — separate layer so it is cached independently
-RUN pip install --no-cache-dir \
-    --index-url https://download.pytorch.org/whl/cu124 \
-    "torch==2.6.0"
+# 2. Install lightweight environment dependencies
+# Make sure fastapi, uvicorn, pydantic, and libclang are in this file!
+COPY requirements-env.txt .
+RUN pip install --no-cache-dir -r requirements-env.txt
 
-# Training dependencies
-RUN pip install --no-cache-dir \
-    "transformers==5.5.0" \
-    "accelerate==1.13.0" \
-    "trl==0.24.0" \
-    "peft==0.18.1" \
-    "bitsandbytes==0.49.2" \
-    "datasets>=3.4.1,<4.4.0" \
-    "unsloth==2026.4.8" \
-    "matplotlib>=3.8.0" \
-    "pyyaml>=6.0" \
-    "tree-sitter>=0.22.0" \
-    "tree-sitter-c>=0.21.0" \
-    "wandb>=0.17.0"
-
-# Application code
+# 3. Copy the codebase
 COPY . .
 
-ENV PYTHONUNBUFFERED=1
+# 4. Expose the Hugging Face health check port
+EXPOSE 7860
 
-CMD ["python", "-u", "train.py", "--config", "configs/config.yaml"]
+# 5. Boot the FastAPI Environment Server
+CMD ["uvicorn", "env.server.app:app", "--host", "0.0.0.0", "--port", "7860"]

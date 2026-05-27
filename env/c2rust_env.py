@@ -1,203 +1,180 @@
-"""
-OpenRL-compatible custom environment for C→Rust migration.
-
-The environment presents one C source file at a time.  The agent produces a
-Rust translation; the rustc compiler grades it and returns a shaped reward.
-"""
+"""OpenEnv wrapper for the C-to-Rust migration task."""
 
 from __future__ import annotations
 
-import os
 import random
+import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Tuple
 
-from tester.compiler import CompilerResult, compile_and_evaluate
-from analyzer.static import parse_c_ast
-from memory.store import MigrationStore
-
-
-# ── Observation / action type aliases ───────────────────────────────────────
-
-Observation = dict[str, Any]
-Action = dict[str, str]   # {"rust_code": str}
-Info = dict[str, Any]
+from reward import compute_reward
 
 
 class C2RustEnv:
-    """
-    Gym-style environment wrapping the C→Rust migration task.
-
-    Compatible with OpenRL's BaseEnv interface (reset / step / close).
-    """
+    """Gym/OpenEnv style wrapper around repo-native reward logic."""
 
     metadata = {"render_modes": []}
 
-    def __init__(
-        self,
-        data_dir: str = "data/c_programs",
-        max_retries: int = 5,
-        timeout: int = 30,
-        run_clippy: bool = True,
-        store_path: str = "migration_state.json",
-        seed: Optional[int] = None,
-    ) -> None:
-        self.data_dir = Path(data_dir)
-        self.max_retries = max_retries
-        self.timeout = timeout
-        self.run_clippy = run_clippy
-        self.store = MigrationStore(store_path)
-        self._rng = random.Random(seed)
+    def __init__(self, data_dir: Optional[str] = None, max_retries: int = 5):
+        self.max_retries = max(1, int(max_retries))
+        self._rng = random.Random()
 
-        self._c_files: list[Path] = sorted(self.data_dir.glob("*.c"))
-        if not self._c_files:
-            raise FileNotFoundError(f"No .c files found in {self.data_dir}")
+        self.data_dir, self._c_files = self._discover_c_files(data_dir)
 
-        # Per-episode state
+        # Episode state
         self._current_file: Optional[Path] = None
-        self._c_source: str = ""
-        self._c_ast: dict = {}
-        self._reference_output: str = ""
-        self._previous_rust: str = ""
-        self._compiler_errors: list = []
-        self._error_count: int = 0
-        self._retry_count: int = 0
-        self._done: bool = False
-
-    # ── Gym API ─────────────────────────────────────────────────────────────
-
-    def reset(
-        self,
-        *,
-        seed: Optional[int] = None,
-        options: Optional[dict] = None,
-    ) -> tuple[Observation, Info]:
-        if seed is not None:
-            self._rng.seed(seed)
-
-        # Pick a C file that hasn't been successfully migrated yet
-        pending = [
-            f for f in self._c_files
-            if not self.store.is_migrated(f.stem)
-        ]
-        if not pending:
-            pending = self._c_files  # all done — cycle again
-
-        self._current_file = self._rng.choice(pending)
-        self._c_source = self._current_file.read_text(encoding="utf-8")
-        self._c_ast = parse_c_ast(self._c_source)
-
-        ref_path = self._current_file.with_suffix(".ref.txt")
-        self._reference_output = ref_path.read_text(encoding="utf-8") if ref_path.exists() else ""
-
-        self._previous_rust = ""
-        self._compiler_errors = []
-        self._error_count = 0
+        self._c_source = ""
+        self._c_ast: Dict[str, Any] = {}
         self._retry_count = 0
         self._done = False
 
-        obs = self._build_obs()
-        info: Info = {"file": str(self._current_file), "action": "reset"}
+    @staticmethod
+    def _discover_c_files(data_dir: Optional[str]) -> Tuple[Path, list[Path]]:
+        candidates: list[Path] = []
+        if data_dir:
+            candidates.append(Path(data_dir))
+
+        # Prefer this repository's default source tree first.
+        candidates.extend([
+            Path("c_migration_test_3"),
+            Path("data/c_programs"),
+            Path("."),
+        ])
+
+        seen: set[Path] = set()
+        for candidate in candidates:
+            root = candidate.expanduser().resolve()
+            if root in seen or not root.exists() or not root.is_dir():
+                continue
+            seen.add(root)
+
+            c_files = [
+                f
+                for f in root.rglob("*.c")
+                if ".git" not in f.parts and "__pycache__" not in f.parts
+            ]
+            if c_files:
+                return root, sorted(c_files)
+
+        fallback = Path(data_dir).expanduser().resolve() if data_dir else Path(".").resolve()
+        return fallback, []
+
+    @staticmethod
+    def _extract_action_text(action: Any) -> str:
+        if isinstance(action, str):
+            return action
+        if isinstance(action, dict):
+            for key in ("rust_code", "text", "output", "answer"):
+                value = action.get(key)
+                if isinstance(value, str):
+                    return value
+        return ""
+
+    @staticmethod
+    def _analyze_c_source(c_source: str) -> Dict[str, Any]:
+        # Lightweight parser fallback: avoids hard dependency on libclang at import time.
+        include_matches = re.findall(r'^\s*#include\s+["<]([^">]+)[">]', c_source, flags=re.MULTILINE)
+        function_matches = re.findall(
+            r"^\s*(?:static\s+)?(?:inline\s+)?[\w\*\s]+\s+([A-Za-z_]\w*)\s*\([^;]*\)\s*\{",
+            c_source,
+            flags=re.MULTILINE,
+        )
+
+        return {
+            "line_count": len(c_source.splitlines()),
+            "includes": sorted(set(include_matches)),
+            "functions": sorted(set(function_matches)),
+        }
+
+    def _refresh_files(self) -> None:
+        self.data_dir, self._c_files = self._discover_c_files(str(self.data_dir))
+
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        options: Optional[dict] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        del options
+
+        if seed is not None:
+            self._rng.seed(seed)
+
+        if not self._c_files:
+            self._refresh_files()
+        if not self._c_files:
+            raise FileNotFoundError(
+                f"No .c files found under {self.data_dir}. "
+                "Set data_dir to your C source root (for this repo, c_migration_test_3)."
+            )
+
+        self._current_file = self._rng.choice(self._c_files)
+        self._c_source = self._current_file.read_text(encoding="utf-8", errors="ignore")
+        self._c_ast = self._analyze_c_source(self._c_source)
+
+        self._retry_count = 0
+        self._done = False
+
+        obs = {
+            "c_source": self._c_source,
+            "c_ast": self._c_ast,
+            "previous_rust": "",
+            "compiler_errors": [],
+            "retry_count": self._retry_count,
+        }
+        info = {
+            "file": str(self._current_file),
+            "source_root": str(self.data_dir),
+        }
         return obs, info
 
-    def step(self, action: Action) -> tuple[Observation, float, bool, bool, Info]:
-        """
-        action: {"rust_code": str}
-
-        Returns (observation, reward, terminated, truncated, info)
-        """
+    def step(self, action: Any) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
         if self._done:
-            raise RuntimeError("step() called on a finished episode — call reset() first")
+            raise RuntimeError("Episode finished, call reset() before step().")
 
-        rust_code: str = action.get("rust_code", "")
-        module = self._current_file.stem if self._current_file else "unknown"
+        if self._current_file is None:
+            raise RuntimeError("Environment not initialized, call reset() before step().")
 
-        result: CompilerResult = compile_and_evaluate(
-            rust_code=rust_code,
-            reference_output=self._reference_output or None,
-            timeout=self.timeout,
-            run_clippy=self.run_clippy,
-        )
+        rust_code = self._extract_action_text(action)
+        module_name = self._current_file.stem
 
-        # Update episode state
-        self._previous_rust = rust_code
-        self._compiler_errors = [
-            {
-                "message": e.message,
-                "code": e.code,
-                "level": e.level,
-                "line": e.line,
-                "column": e.column,
-                "rendered": e.rendered,
-            }
-            for e in result.errors
-        ]
-        self._error_count = len(result.errors)
+        reward, reward_info = compute_reward(rust_code, module_name=module_name)
+        success = bool(reward_info.error_count == 0 and reward_info.compilation_score >= 1.0)
+        errors = reward_info.errors
+
         self._retry_count += 1
 
-        # Persist to store
-        self.store.update(
-            module=module,
-            success=result.success,
-            retry_count=self._retry_count,
-            error_type=result.error_type,
-            reward=result.reward,
-            rust_code=rust_code if result.success else None,
-        )
-
-        # Termination conditions
-        terminated = result.success and result.test_passed is not False
+        terminated = success
         truncated = self._retry_count >= self.max_retries
-
         if terminated or truncated:
             self._done = True
 
-        obs = self._build_obs()
-        info: Info = {
-            "error_type": result.error_type,
-            "error_line": result.error_line,
-            "compiler_output": result.raw_stderr,
-            "unsafe_count": result.unsafe_count,
-            "test_passed": result.test_passed,
-            "clippy_clean": result.clippy_clean,
-            "module": module,
-        }
-
-        return obs, result.reward, terminated, truncated, info
-
-    def close(self) -> None:
-        self.store.save()
-
-    # ── Internal helpers ─────────────────────────────────────────────────────
-
-    def _build_obs(self) -> Observation:
-        return {
+        obs = {
             "c_source": self._c_source,
             "c_ast": self._c_ast,
-            "previous_rust": self._previous_rust,
-            "compiler_errors": self._compiler_errors,
-            "error_count": self._error_count,
+            "previous_rust": rust_code,
+            "compiler_errors": errors,
             "retry_count": self._retry_count,
-            "migration_context": self.store.get_context(),
         }
 
-    # ── OpenRL compatibility shim ────────────────────────────────────────────
+        info = {
+            "module": self._current_file.name,
+            "success": success,
+            "unsafe_count": reward_info.unsafe_count,
+            "warning_count": reward_info.warning_count,
+            "error_count": reward_info.error_count,
+            "errors": errors,
+            "compilation_score": reward_info.compilation_score,
+        }
+
+        return obs, reward, terminated, truncated, info
 
     @property
     def observation_space(self) -> dict:
-        return {"type": "dict", "description": "C→Rust migration observation"}
+        return {"type": "dict", "description": "C source, static summary, and compiler feedback"}
 
     @property
     def action_space(self) -> dict:
-        return {"type": "dict", "description": "Generated Rust code"}
+        return {"type": "text", "description": "Generated Rust code as string"}
 
-    @property
-    def reward_range(self) -> tuple[float, float]:
-        return (-1.0, 1.0)
-
-    def __repr__(self) -> str:
-        return (
-            f"C2RustEnv(data_dir={self.data_dir!r}, "
-            f"files={len(self._c_files)}, "
-            f"max_retries={self.max_retries})"
-        )
+    def close(self) -> None:
+        return None
